@@ -1,0 +1,120 @@
+
+name: Build updated Hermux APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build self-signed Android app
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out my fork
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android build tools
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install 'platforms;android-36' 'build-tools;35.0.0'
+
+      - name: Build web interface
+        working-directory: web
+        shell: bash
+        run: |
+          npm ci
+          npx vite build
+          test -s dist/index.html
+
+      - name: Log download hosts and retry temporary failures
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/hermux-tools"
+          cat > "$RUNNER_TEMP/hermux-tools/curl" <<'SH'
+          #!/usr/bin/env bash
+          # Logs only the domain, not URLs or credentials.
+          url=''
+          for arg in "$@"; do
+            case "$arg" in
+              http://*|https://*) url="$arg"; break ;;
+            esac
+          done
+          host='unknown'
+          if [[ -n "$url" ]]; then
+            host="$(python3 - "$url" <<'PY'
+          import sys
+          from urllib.parse import urlsplit
+          print(urlsplit(sys.argv[1]).hostname or 'unknown')
+          PY
+          )"
+          fi
+          echo "Hermux download host: $host" >&2
+
+          args=("$@")
+          for attempt in 1 2; do
+            if /usr/bin/curl "${args[@]}"; then
+              exit 0
+            else
+              status=$?
+            fi
+            echo "Hermux download attempt $attempt failed: host=$host curl_exit=$status" >&2
+            if [[ $attempt -eq 1 ]]; then
+              for i in "${!args[@]}"; do
+                case "${args[i]}" in
+                  https://repo1.maven.org/maven2/*)
+                    args[i]="https://repo.maven.apache.org/maven2/${args[i]#https://repo1.maven.org/maven2/}"
+                    host='repo.maven.apache.org'
+                    echo 'Retrying from the official Maven Central alternate host' >&2
+                    ;;
+                  https://repo.maven.apache.org/maven2/*)
+                    args[i]="https://repo1.maven.org/maven2/${args[i]#https://repo.maven.apache.org/maven2/}"
+                    host='repo1.maven.org'
+                    echo 'Retrying from the official Maven Central alternate host' >&2
+                    ;;
+                esac
+              done
+              sleep 5
+            fi
+          done
+          echo "::error::Hermux dependency download failed from $host (curl exit $status)" >&2
+          exit "$status"
+          SH
+          chmod +x "$RUNNER_TEMP/hermux-tools/curl"
+          echo "$RUNNER_TEMP/hermux-tools" >> "$GITHUB_PATH"
+
+      - name: Build APK from checked-out sources
+        shell: bash
+        env:
+          HM_SKIP_WEB_BUILD: '1'
+          VERSION_NAME: '0.8.99-local'
+          VERSION_CODE: '89999'
+          KEYSTORE: ${{ runner.temp }}/hermux-selfbuild.keystore
+        run: |
+          bash android/build.sh
+          test -s android/build/hermes-mobile.apk
+
+      - name: Upload finished APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermux-updated-apk
+          path: android/build/hermes-mobile.apk
+          if-no-files-found: error
+          retention-days: 7
